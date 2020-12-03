@@ -35,6 +35,7 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 volatile enum {IDLE, HALFPT, DONE} currState_flash;
+volatile uint8_t doneRecording = 0;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -54,6 +55,7 @@ volatile enum {IDLE, HALFPT, DONE} currState_flash;
 #define TONE_BUFFER_SIZE	2000							// 2000 samples (~0.05 seconds of samples)
 #define HALF_BUFFER_SIZE	1000							// 1000 samples (~0.02 seconds of samples)
 #define NUM_BLOCKS_FLASH	(uint32_t)(NUM_TOTAL_SAMPLES/MX25R6435F_BLOCK_SIZE) + 1
+#define RECSAMPLES			11025
 
 // VOICE PLAYBACK PARAMS
 #define MAX_MUL_PB			4
@@ -72,6 +74,10 @@ ADC_HandleTypeDef hadc1;
 DAC_HandleTypeDef hdac1;
 DMA_HandleTypeDef hdma_dac_ch1;
 
+DFSDM_Filter_HandleTypeDef hdfsdm1_filter0;
+DFSDM_Channel_HandleTypeDef hdfsdm1_channel2;
+DMA_HandleTypeDef hdma_dfsdm1_flt0;
+
 I2C_HandleTypeDef hi2c2;
 
 QSPI_HandleTypeDef hqspi;
@@ -85,7 +91,11 @@ UART_HandleTypeDef huart1;
 // ------------------ DEFINITIONS ------------------ //
 // Audio playback var definitions
 uint8_t audioBuffer[TONE_BUFFER_SIZE];
+
 uint8_t tempBuffer[TEMP_BUFFER_SIZE];
+
+uint32_t recordBuffer[RECSAMPLES];
+uint8_t recordBufferProc[RECSAMPLES];
 uint32_t newStart = 0;
 uint32_t nextPosition = 0;
 uint8_t currTimeStep = 0;
@@ -109,6 +119,7 @@ static void MX_QUADSPI_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_DFSDM1_Init(void);
 /* USER CODE BEGIN PFP */
 
 void GenerateTone(uint8_t *array, float vol, float freq, uint32_t nSamples);
@@ -158,6 +169,7 @@ int main(void)
   MX_I2C2_Init();
   MX_USART1_UART_Init();
   MX_ADC1_Init();
+  MX_DFSDM1_Init();
   /* USER CODE BEGIN 2 */
 
   if (BSP_ACCELERO_Init() != ACCELERO_OK){
@@ -190,29 +202,63 @@ int main(void)
   		  Error_Handler();
   }
 
-  // Write the C6 tone to FLASH repeatedly for 20 seconds
-  uint8_t reachEndFlash = 0;
+//  // Write the C6 tone to FLASH repeatedly for 20 seconds
+//  uint8_t reachEndFlash = 0;
+//  newStart = START_WRITE_ADR;
+//  nextPosition = newStart;
+//
+//  while (!reachEndFlash){
+//
+//	  nextPosition = newStart + TONE_BUFFER_SIZE;
+//
+//	  if (nextPosition >= NUM_TOTAL_SAMPLES){
+//		  reachEndFlash = 1;
+//
+//		  if (BSP_QSPI_Write(&audioBuffer[0], newStart, (NUM_TOTAL_SAMPLES-newStart)) != QSPI_OK)
+//			  Error_Handler();
+//
+//		  break;
+//	  }
+//
+//	  if (BSP_QSPI_Write(audioBuffer, newStart, TONE_BUFFER_SIZE) != QSPI_OK)
+//		  Error_Handler();
+//
+//	  newStart = nextPosition;
+//  }
+
+  // Record 20 seconds and write to FLASH
+  HAL_GPIO_WritePin(GREEN_LED_GPIO_Port, GREEN_LED_Pin, GPIO_PIN_SET);
+  HAL_Delay(500);
+  HAL_GPIO_WritePin(GREEN_LED_GPIO_Port, GREEN_LED_Pin, GPIO_PIN_RESET);
+  HAL_Delay(500);
+//  HAL_GPIO_WritePin(GREEN_LED_GPIO_Port, GREEN_LED_Pin, GPIO_PIN_SET);
+
   newStart = START_WRITE_ADR;
-  nextPosition = newStart;
 
-  while (!reachEndFlash){
+  for (uint8_t i = 0; i < 80; i++){
 
-	  nextPosition = newStart + TONE_BUFFER_SIZE;
+	  HAL_GPIO_WritePin(GREEN_LED_GPIO_Port, GREEN_LED_Pin, GPIO_PIN_SET);
+	  HAL_DFSDM_FilterRegularStart_DMA (&hdfsdm1_filter0, (int32_t *)recordBuffer , TONE_BUFFER_SIZE);
+	  while (!doneRecording); //doneRecording needs to be set to 1 by the ISR
+	  HAL_DFSDM_FilterRegularStop_DMA(&hdfsdm1_filter0);
 
-	  if (nextPosition >= NUM_TOTAL_SAMPLES){
-		  reachEndFlash = 1;
+	  for (uint32_t i=0; i < RECSAMPLES; i++){
+		  // trim the 32 bit signed number to 24 MSBs first, then instead of directly converting to 8 bits, 'amplify' the sound a bit
+		  int32_t currSample = recordBuffer[i] >> (8 + (24-16));
 
-		  if (BSP_QSPI_Write(&audioBuffer[0], newStart, (NUM_TOTAL_SAMPLES-newStart)) != QSPI_OK)
-			  Error_Handler();
-
-		  break;
+		  // convert 8 bit signed to 8 bit unsigned
+		  recordBufferProc[i] = (uint8_t)currSample + 80;
 	  }
+	  doneRecording = 0;
 
-	  if (BSP_QSPI_Write(audioBuffer, newStart, TONE_BUFFER_SIZE) != QSPI_OK)
+	  HAL_GPIO_WritePin(GREEN_LED_GPIO_Port, GREEN_LED_Pin, GPIO_PIN_RESET);
+	  if (BSP_QSPI_Write(recordBufferProc, newStart, RECSAMPLES) != QSPI_OK)
 		  Error_Handler();
 
-	  newStart = nextPosition;
+	  newStart += RECSAMPLES;
   }
+
+  HAL_GPIO_WritePin(GREEN_LED_GPIO_Port, GREEN_LED_Pin, GPIO_PIN_RESET);
 
   // Reset audio buffer
   memset(&audioBuffer[0], 0, sizeof(audioBuffer));
@@ -358,10 +404,11 @@ void SystemClock_Config(void)
     Error_Handler();
   }
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1|RCC_PERIPHCLK_I2C2
-                              |RCC_PERIPHCLK_ADC;
+                              |RCC_PERIPHCLK_DFSDM1|RCC_PERIPHCLK_ADC;
   PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
   PeriphClkInit.I2c2ClockSelection = RCC_I2C2CLKSOURCE_PCLK1;
   PeriphClkInit.AdcClockSelection = RCC_ADCCLKSOURCE_PLLSAI1;
+  PeriphClkInit.Dfsdm1ClockSelection = RCC_DFSDM1CLKSOURCE_PCLK;
   PeriphClkInit.PLLSAI1.PLLSAI1Source = RCC_PLLSOURCE_MSI;
   PeriphClkInit.PLLSAI1.PLLSAI1M = 1;
   PeriphClkInit.PLLSAI1.PLLSAI1N = 24;
@@ -483,6 +530,59 @@ static void MX_DAC1_Init(void)
   /* USER CODE BEGIN DAC1_Init 2 */
 
   /* USER CODE END DAC1_Init 2 */
+
+}
+
+/**
+  * @brief DFSDM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DFSDM1_Init(void)
+{
+
+  /* USER CODE BEGIN DFSDM1_Init 0 */
+
+  /* USER CODE END DFSDM1_Init 0 */
+
+  /* USER CODE BEGIN DFSDM1_Init 1 */
+
+  /* USER CODE END DFSDM1_Init 1 */
+  hdfsdm1_filter0.Instance = DFSDM1_Filter0;
+  hdfsdm1_filter0.Init.RegularParam.Trigger = DFSDM_FILTER_SW_TRIGGER;
+  hdfsdm1_filter0.Init.RegularParam.FastMode = ENABLE;
+  hdfsdm1_filter0.Init.RegularParam.DmaMode = ENABLE;
+  hdfsdm1_filter0.Init.FilterParam.SincOrder = DFSDM_FILTER_SINC3_ORDER;
+  hdfsdm1_filter0.Init.FilterParam.Oversampling = 75;
+  hdfsdm1_filter0.Init.FilterParam.IntOversampling = 1;
+  if (HAL_DFSDM_FilterInit(&hdfsdm1_filter0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  hdfsdm1_channel2.Instance = DFSDM1_Channel2;
+  hdfsdm1_channel2.Init.OutputClock.Activation = ENABLE;
+  hdfsdm1_channel2.Init.OutputClock.Selection = DFSDM_CHANNEL_OUTPUT_CLOCK_SYSTEM;
+  hdfsdm1_channel2.Init.OutputClock.Divider = 67;
+  hdfsdm1_channel2.Init.Input.Multiplexer = DFSDM_CHANNEL_EXTERNAL_INPUTS;
+  hdfsdm1_channel2.Init.Input.DataPacking = DFSDM_CHANNEL_STANDARD_MODE;
+  hdfsdm1_channel2.Init.Input.Pins = DFSDM_CHANNEL_SAME_CHANNEL_PINS;
+  hdfsdm1_channel2.Init.SerialInterface.Type = DFSDM_CHANNEL_SPI_RISING;
+  hdfsdm1_channel2.Init.SerialInterface.SpiClock = DFSDM_CHANNEL_SPI_CLOCK_INTERNAL;
+  hdfsdm1_channel2.Init.Awd.FilterOrder = DFSDM_CHANNEL_FASTSINC_ORDER;
+  hdfsdm1_channel2.Init.Awd.Oversampling = 1;
+  hdfsdm1_channel2.Init.Offset = 0;
+  hdfsdm1_channel2.Init.RightBitShift = 0x00;
+  if (HAL_DFSDM_ChannelInit(&hdfsdm1_channel2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DFSDM_FilterConfigRegChannel(&hdfsdm1_filter0, DFSDM_CHANNEL_2, DFSDM_CONTINUOUS_CONV_ON) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DFSDM1_Init 2 */
+
+  /* USER CODE END DFSDM1_Init 2 */
 
 }
 
@@ -658,6 +758,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel3_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
+  /* DMA1_Channel4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
 
 }
 
@@ -804,6 +907,12 @@ void HAL_DAC_ConvCpltCallbackCh1(DAC_HandleTypeDef *hdac){
 	if (hdac->Instance == DAC1){
 		currState_flash = DONE;
 	}
+}
+
+void HAL_DFSDM_FilterRegConvCpltCallback (DFSDM_Filter_HandleTypeDef * hdfsdm_filter){
+//	if (hdfsdm_filter->Instance == DFSDM1_Filter0){
+		doneRecording = 1;
+//	}
 }
 
 /* USER CODE END 4 */
